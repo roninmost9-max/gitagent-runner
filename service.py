@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -509,6 +510,83 @@ def action_logs(params: dict) -> dict:
     )
 
 
+def remove_readonly(func: Callable[..., Any], target: str, _exc_info: tuple) -> None:
+    """Снимает атрибут «только для чтения» и повторяет операцию (файлы git)."""
+
+    os.chmod(target, stat.S_IWRITE | stat.S_IREAD)
+    func(target)
+
+
+def jobs_for_path(path: Path) -> list[Job]:
+    """Процессы, запущенные сервисом из указанной папки или её подпапок."""
+
+    with JOBS_LOCK:
+        jobs = list(JOBS.values())
+
+    found: list[Job] = []
+    for job in jobs:
+        try:
+            job_path = job.path.resolve()
+        except OSError:
+            job_path = job.path
+        if job_path == path or path in job_path.parents:
+            found.append(job)
+
+    return found
+
+
+def action_delete(params: dict) -> dict:
+    """Удаляет папку репозитория вместе с содержимым."""
+
+    path = repo_path(params.get("name"))
+
+    base = REPOS_DIR.resolve()
+    if path == base or base not in path.parents:
+        raise ActionError("Удалять можно только папки внутри каталога репозиториев.")
+
+    if not path.exists():
+        return reply(
+            False,
+            "",
+            f"Папка {path} не найдена — возможно, её уже удалили.",
+            f"Папка {path} не существует.",
+        )
+
+    if not path.is_dir():
+        raise ActionError(f"{path} — не папка, удалять её не буду.")
+
+    running = [job for job in jobs_for_path(path) if not job.finished.is_set()]
+    for job in running:
+        job.stop()
+    for job in running:
+        job.finished.wait(timeout=10)
+
+    try:
+        shutil.rmtree(path, onerror=remove_readonly)
+    except OSError as exc:
+        return reply(
+            False,
+            "",
+            f"Папку {path} удалить не удалось — возможно, файлы заняты другим процессом. "
+            "Подробности в поле error.",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+    stopped = ", ".join(str(job.pid) for job in running)
+    explanation = f"Папка {path} удалена вместе с содержимым."
+    if running:
+        explanation += (
+            " Перед удалением остановлены запущенные сервисом процессы: "
+            f"{stopped} (чужие процессы не затрагивались)."
+        )
+
+    output = f"Удалено: {path}"
+    if running:
+        output += f"\nОстановлены процессы сервиса: {stopped}"
+
+    return reply(True, output, explanation, None)
+
+
 ACTIONS: dict[str, Callable[[dict], dict]] = {
     "clone": action_clone,
     "detect": action_detect,
@@ -516,6 +594,7 @@ ACTIONS: dict[str, Callable[[dict], dict]] = {
     "run": action_run,
     "stop": action_stop,
     "logs": action_logs,
+    "delete": action_delete,
 }
 
 
